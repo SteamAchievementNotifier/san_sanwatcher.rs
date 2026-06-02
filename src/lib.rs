@@ -33,6 +33,107 @@ pub struct WatchEvent {
 
 static CALLBACK: Lazy<Mutex<Option<Arc<ThreadsafeFunction<WatchEvent>>>>> = Lazy::new(|| Mutex::new(None));
 
+#[napi(object)]
+pub struct ActiveProcess {
+    pub pid: u32,
+    pub exe: String
+}
+
+#[cfg(target_os = "windows")]
+fn get_active_processes_win(installdir: &str) -> Vec<ActiveProcess> {
+    use win32::*;
+
+    let mut processes = Vec::new();
+
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0) else {
+            return processes
+        };
+
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let pid = entry.th32ProcessID;
+
+                if pid != 0 {
+                    if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_ACCESS_RIGHTS(0x00100000),false,pid) {
+                        let mut buffer = [0u16; 1024];
+                        let mut size = buffer.len() as u32;
+
+                        if QueryFullProcessImageNameW(process,PROCESS_NAME_FORMAT(0),PWSTR(buffer.as_mut_ptr()),&mut size).is_ok() {
+                            let path = String::from_utf16_lossy(&buffer[..size as usize]).replace("\\","/");
+
+                            if path.to_lowercase().starts_with(&installdir.to_lowercase().replace("\\","/")) || path.to_lowercase().ends_with("sam.game.exe") {
+                                processes.push(ActiveProcess { pid, exe: path });
+                            }
+                        }
+
+                        let _ = CloseHandle(process);
+                    }
+                }
+
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break
+                }
+            }
+        }
+
+        let _ = CloseHandle(snapshot);
+    }
+
+    processes
+}
+
+#[cfg(target_os="linux")]
+fn get_active_processes_linux(installdir: &str) -> Vec<ActiveProcess> {
+    let mut processes = Vec::new();
+
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return processes
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let pid_str = file_name.to_string_lossy();
+
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue
+        }
+
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue
+        };
+
+        let exe_path = format!("/proc/{}/exe", pid);
+
+        let Ok(path) = fs::read_link(&exe_path) else {
+            continue
+        };
+
+        let path = path.to_string_lossy().to_string();
+
+        if path.to_lowercase().starts_with(&installdir.to_lowercase().replace("\\","/")) {
+            processes.push(ActiveProcess { pid, exe: path });
+        }
+    }
+
+    processes
+}
+
+#[napi]
+pub fn get_active_processes(installdir: String) -> Vec<ActiveProcess> {
+    #[cfg(target_os="windows")] {
+        return get_active_processes_win(&installdir)
+    }
+    
+    #[cfg(target_os="linux")] {
+        return get_active_processes_linux(&installdir)
+    }
+}
+
 #[napi]
 pub fn stop() {
     let mut watcher_guard = WATCHER.lock().unwrap_or_else(|e| e.into_inner());
@@ -70,99 +171,57 @@ pub fn start(installdir: String,pollrate: u32,callback: JsFunction) {
             use win32::*;
 
             while watcher.running.load(Ordering::SeqCst) {
-                unsafe {
-                    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+                for process in get_active_processes_win(&watcher.install_dir) {
+                    let pid = process.pid;
+                    let path = process.exe;
 
-                    let Ok(snapshot) = snapshot else {
-                        thread::sleep(Duration::from_secs(1));
-                        continue
+                    let seen = {
+                        let seen = watcher.seen.lock().unwrap_or_else(|e| e.into_inner());
+                        seen.contains(&pid)
                     };
 
-                    let mut entry = PROCESSENTRY32W::default();
-                    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-
-                    if Process32FirstW(snapshot,&mut entry).is_ok() {
-                        loop {
-                            let pid = entry.th32ProcessID;
-
-                            if pid != 0 {
-                                let seen = {
-                                    let seen = watcher.seen.lock().unwrap_or_else(|e| e.into_inner());
-                                    seen.contains(&pid)
-                                };
-
-                                if !seen {
-                                    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_ACCESS_RIGHTS(0x00100000),false,pid);
-
-                                    if let Ok(process) = process {
-                                        let mut buffer = [0u16; 1024];
-                                        let mut size = buffer.len() as u32;
-
-                                        let img_name = QueryFullProcessImageNameW(process,PROCESS_NAME_FORMAT(0),PWSTR(buffer.as_mut_ptr()),&mut size);
-
-                                        if img_name.is_ok() {
-                                            let path = String::from_utf16_lossy(&buffer[..size as usize]).replace("\\","/");
-
-                                            if path.to_lowercase().starts_with(&watcher.install_dir.to_lowercase()) || path.to_lowercase().ends_with("sam.game.exe") {
-                                                watcher.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
-
-                                                // println!("INSTALLDIR PROCESS STARTED:");
-                                                // println!("PID: {}",pid);
-                                                // println!("EXECUTABLE PATH: {}\n",path);
-
-                                                if let Some(cb) = CALLBACK.lock().unwrap().clone() {
-                                                    let result = Ok(WatchEvent {
-                                                        started: true,
-                                                        pid,
-                                                        exe: path.clone()
-                                                    });
-                                                    
-                                                    let _ = cb.call(result,ThreadsafeFunctionCallMode::NonBlocking);
-                                                }
-
-                                                let raw_handle = process.0 as isize;
-                                                let watcher_clone = Arc::clone(&watcher);
-
-                                                thread::spawn(move || {
-                                                    let process = HANDLE(raw_handle as *mut c_void);
-
-                                                    WaitForSingleObject(process, INFINITE);
-
-                                                    // println!("INSTALLDIR PROCESS CLOSED:");
-                                                    // println!("PID: {}", pid);
-                                                    // println!("PATH: {}\n", path);
-
-                                                    if let Some(cb) = CALLBACK.lock().unwrap().clone() {
-                                                        let result = Ok(WatchEvent {
-                                                            started: false,
-                                                            pid,
-                                                            exe: path.clone()
-                                                        });
-                                                        
-                                                        let _ = cb.call(result,ThreadsafeFunctionCallMode::NonBlocking);
-                                                    }
-
-                                                    let _ = CloseHandle(process);
-
-                                                    watcher_clone.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
-                                                });
-                                            } else {
-                                                let _ = CloseHandle(process);
-                                            }
-                                        } else {
-                                            let _ = CloseHandle(process);
-                                        }
-                                    }
-                                }
-                            }
-
-                            if Process32NextW(snapshot,&mut entry).is_err() {
-                                break
-                            }
-                        }
+                    if seen {
+                        continue
                     }
 
-                    let _ = CloseHandle(snapshot);
+                    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_ACCESS_RIGHTS(0x00100000),false,pid) };
+
+                    if let Ok(process) = process {
+                        watcher.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
+
+                        if let Some(cb) = CALLBACK.lock().unwrap().clone() {
+                            let result = Ok(WatchEvent {
+                                started: true,
+                                pid,
+                                exe: path.clone()
+                            });
+
+                            let _ = cb.call(result,ThreadsafeFunctionCallMode::NonBlocking);
+                        }
+
+                        let raw_handle = process.0 as isize;
+                        let watcher_clone = Arc::clone(&watcher);
+
+                        thread::spawn(move || {
+                            let process = HANDLE(raw_handle as *mut c_void);
+
+                            unsafe { WaitForSingleObject(process,INFINITE); }
+
+                            if let Some(cb) = CALLBACK.lock().unwrap().clone() {
+                                let result = Ok(WatchEvent {
+                                    started: false,
+                                    pid,
+                                    exe: path.clone()
+                                });
+
+                                let _ = cb.call(result,ThreadsafeFunctionCallMode::NonBlocking);
+                            }
+
+                            let _ = unsafe { CloseHandle(process) };
+
+                            watcher_clone.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+                        });
+                    }
                 }
 
                 thread::sleep(pollrate);
@@ -175,23 +234,9 @@ pub fn start(installdir: String,pollrate: u32,callback: JsFunction) {
             use linux::*;
 
             while watcher.running.load(Ordering::SeqCst) {
-                let Ok(entries) = fs::read_dir("/proc") else {
-                    thread::sleep(pollrate);
-                    continue
-                };
-
-                for entry in entries.flatten() {
-                    let file_name = entry.file_name();
-                    let pid_str = file_name.to_string_lossy();
-
-                    if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-                        continue
-                    }
-
-                    let pid: u32 = match pid_str.parse() {
-                        Ok(p) => p,
-                        Err(_) => continue
-                    };
+                for process in get_active_processes_linux(&watcher.install_dir) {
+                    let pid = process.pid;
+                    let path = process.exe;
 
                     {
                         let mut seen = watcher.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -203,24 +248,6 @@ pub fn start(installdir: String,pollrate: u32,callback: JsFunction) {
                         seen.insert(pid);
                     }
 
-                    let exe_path = format!("/proc/{}/exe", pid);
-
-                    let Ok(path) = fs::read_link(&exe_path) else {
-                        watcher.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
-                        continue
-                    };
-
-                    let path = path.to_string_lossy().to_string();
-
-                    if !path.to_lowercase().starts_with(&watcher.install_dir.to_lowercase()) {
-                        watcher.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
-                        continue
-                    }
-
-                    // println!("INSTALLDIR PROCESS STARTED:");
-                    // println!("PID: {}",pid);
-                    // println!("PATH: {}\n",path);
-
                     let watcher_clone = Arc::clone(&watcher);
 
                     thread::spawn(move || {
@@ -230,18 +257,14 @@ pub fn start(installdir: String,pollrate: u32,callback: JsFunction) {
                             thread::sleep(pollrate);
                         }
 
-                        // println!("INSTALLDIR PROCESS CLOSED:");
-                        // println!("PID: {}",pid);
-                        // println!("PATH: {}\n",path);
-
                         if let Some(cb) = CALLBACK.lock().unwrap().clone() {
-                            let _ = cb.call(
-                                Ok(ExitEvent {
-                                    pid,
-                                    path: path.clone()
-                                }),
-                                ThreadsafeFunctionCallMode::NonBlocking
-                            );
+                            let result = Ok(WatchEvent {
+                                started: false,
+                                pid,
+                                exe: path.clone()
+                            });
+
+                            let _ = cb.call(result,ThreadsafeFunctionCallMode::NonBlocking);
                         }
 
                         watcher_clone.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
