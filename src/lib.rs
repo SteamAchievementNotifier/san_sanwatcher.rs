@@ -88,6 +88,8 @@ fn get_active_processes_win(installdir: &str) -> Vec<ActiveProcess> {
 
 #[cfg(target_os="linux")]
 fn get_active_processes_linux(installdir: &str) -> Vec<ActiveProcess> {
+    use linux::*;
+    
     let mut processes = Vec::new();
 
     let Ok(entries) = fs::read_dir("/proc") else {
