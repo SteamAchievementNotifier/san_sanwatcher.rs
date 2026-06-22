@@ -2,6 +2,7 @@ use napi_derive::napi;
 use napi::{threadsafe_function::{ThreadsafeFunction,ThreadsafeFunctionCallMode},JsFunction};
 use once_cell::sync::Lazy;
 use std::{collections::HashSet,sync::{Arc, Mutex, atomic::{AtomicBool,Ordering}},thread, time::Duration};
+pub mod log;
 
 #[cfg(target_os="windows")]
 pub mod win32 {
