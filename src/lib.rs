@@ -18,6 +18,7 @@ pub mod linux {
 
 struct WatcherState {
     install_dir: String,
+    linked_game: Option<String>,
     seen: Mutex<HashSet<u32>>,
     running: AtomicBool
 }
@@ -40,8 +41,12 @@ pub struct ActiveProcess {
     pub exe: String
 }
 
-#[cfg(target_os = "windows")]
-fn get_active_processes_win(installdir: &str) -> Vec<ActiveProcess> {
+fn normalize(path: &str) -> String {
+    path.to_lowercase().replace("\\","/")
+}
+
+#[cfg(target_os="windows")]
+fn get_active_processes_win(installdir: &str,linkedgame: Option<&str>) -> Vec<ActiveProcess> {
     use win32::*;
 
     let mut processes = Vec::new();
@@ -64,9 +69,14 @@ fn get_active_processes_win(installdir: &str) -> Vec<ActiveProcess> {
                         let mut size = buffer.len() as u32;
 
                         if QueryFullProcessImageNameW(process,PROCESS_NAME_FORMAT(0),PWSTR(buffer.as_mut_ptr()),&mut size).is_ok() {
-                            let path = String::from_utf16_lossy(&buffer[..size as usize]).replace("\\","/");
+                            let path = normalize(&String::from_utf16_lossy(&buffer[..size as usize]));
 
-                            if path.to_lowercase().starts_with(&installdir.to_lowercase().replace("\\","/")) || path.to_lowercase().ends_with("sam.game.exe") {
+                            let matched = match linkedgame {
+                                Some(lg) => lg == path,
+                                None => path.starts_with(&installdir) || path.ends_with("sam.game.exe")
+                            };
+
+                            if matched {
                                 processes.push(ActiveProcess { pid, exe: path });
                             }
                         }
@@ -75,7 +85,7 @@ fn get_active_processes_win(installdir: &str) -> Vec<ActiveProcess> {
                     }
                 }
 
-                if Process32NextW(snapshot, &mut entry).is_err() {
+                if Process32NextW(snapshot,&mut entry).is_err() {
                     break
                 }
             }
@@ -88,10 +98,11 @@ fn get_active_processes_win(installdir: &str) -> Vec<ActiveProcess> {
 }
 
 #[cfg(target_os="linux")]
-fn get_active_processes_linux(installdir: &str) -> Vec<ActiveProcess> {
+fn get_active_processes_linux(installdir: &str,linkedgame: Option<&str>) -> Vec<ActiveProcess> {
     use linux::*;
     
     let mut processes = Vec::new();
+    let installdir = normalize(&installdir);
 
     let Ok(entries) = fs::read_dir("/proc") else {
         return processes
@@ -116,9 +127,14 @@ fn get_active_processes_linux(installdir: &str) -> Vec<ActiveProcess> {
             continue
         };
 
-        let path = path.to_string_lossy().to_string();
+        let path = normalize(&path.to_string_lossy().to_string());
 
-        if path.to_lowercase().starts_with(&installdir.to_lowercase().replace("\\","/")) {
+        let matched = match linkedgame {
+            Some(lg) => lg == path,
+            None => path.starts_with(&installdir)
+        };
+
+        if matched {
             processes.push(ActiveProcess { pid, exe: path });
         }
     }
@@ -127,13 +143,13 @@ fn get_active_processes_linux(installdir: &str) -> Vec<ActiveProcess> {
 }
 
 #[napi]
-pub fn get_active_processes(installdir: String) -> Vec<ActiveProcess> {
+pub fn get_active_processes(installdir: String,linkedgame: Option<String>) -> Vec<ActiveProcess> {
     #[cfg(target_os="windows")] {
-        return get_active_processes_win(&installdir)
+        return get_active_processes_win(&normalize(&installdir),linkedgame.map(|str| normalize(&str)).as_deref())
     }
     
     #[cfg(target_os="linux")] {
-        return get_active_processes_linux(&installdir)
+        return get_active_processes_linux(&normalize(&installdir),linkedgame.map(|str| normalize(&str)).as_deref())
     }
 }
 
@@ -149,7 +165,7 @@ pub fn stop() {
 }
 
 #[napi]
-pub fn start(installdir: String,pollrate: u32,callback: JsFunction) {
+pub fn start(installdir: String,linkedgame: Option<String>,pollrate: u32,callback: JsFunction) {
     stop();
 
     let pollrate = Duration::from_millis(pollrate as u64);
@@ -159,7 +175,8 @@ pub fn start(installdir: String,pollrate: u32,callback: JsFunction) {
     *CALLBACK.lock().unwrap() = Some(Arc::new(threadsafe_function));
 
     let watcher = Arc::new(WatcherState {
-        install_dir: installdir.replace("\\","/"),
+        install_dir: normalize(&installdir),
+        linked_game: linkedgame.map(|str| normalize(&str)),
         seen: Mutex::new(HashSet::new()),
         running: AtomicBool::new(true)
     });
@@ -174,7 +191,7 @@ pub fn start(installdir: String,pollrate: u32,callback: JsFunction) {
             use win32::*;
 
             while watcher.running.load(Ordering::SeqCst) {
-                for process in get_active_processes_win(&watcher.install_dir) {
+                for process in get_active_processes_win(&watcher.install_dir,watcher.linked_game.as_deref()) {
                     let pid = process.pid;
                     let path = process.exe;
 
