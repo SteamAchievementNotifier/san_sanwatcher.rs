@@ -195,4 +195,4 @@ Cargo.lock
 !.yarn/versions
 
 *.node
-*.old
+*.old*

@@ -254,7 +254,7 @@ pub fn start(installdir: String,linkedgame: Option<String>,pollrate: u32,callbac
             use linux::*;
 
             while watcher.running.load(Ordering::SeqCst) {
-                for process in get_active_processes_linux(&watcher.install_dir) {
+                for process in get_active_processes_linux(&watcher.install_dir,watcher.linked_game.as_deref()) {
                     let pid = process.pid;
                     let path = process.exe;
 
