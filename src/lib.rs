@@ -268,6 +268,16 @@ pub fn start(installdir: String,linkedgame: Option<String>,pollrate: u32,callbac
                         seen.insert(pid);
                     }
 
+                    if let Some(cb) = CALLBACK.lock().unwrap().clone() {
+                        let result = Ok(WatchEvent {
+                            started: true,
+                            pid,
+                            exe: path.clone()
+                        });
+
+                        let _ = cb.call(result,ThreadsafeFunctionCallMode::NonBlocking);
+                    }
+
                     let watcher_clone = Arc::clone(&watcher);
 
                     thread::spawn(move || {
