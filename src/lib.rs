@@ -69,15 +69,16 @@ fn get_active_processes_win(installdir: &str,linkedgame: Option<&str>) -> Vec<Ac
                         let mut size = buffer.len() as u32;
 
                         if QueryFullProcessImageNameW(process,PROCESS_NAME_FORMAT(0),PWSTR(buffer.as_mut_ptr()),&mut size).is_ok() {
-                            let path = normalize(&String::from_utf16_lossy(&buffer[..size as usize]));
+                            let exe = String::from_utf16_lossy(&buffer[..size as usize]);
+                            let lc_path = normalize(&exe);
 
                             let matched = match linkedgame {
-                                Some(lg) => lg == path,
-                                None => path.starts_with(&installdir) || path.ends_with("sam.game.exe")
+                                Some(lg) => lg == lc_path,
+                                None => lc_path.starts_with(&installdir) || lc_path.ends_with("sam.game.exe")
                             };
 
                             if matched {
-                                processes.push(ActiveProcess { pid, exe: path });
+                                processes.push(ActiveProcess { pid, exe });
                             }
                         }
 
@@ -127,15 +128,16 @@ fn get_active_processes_linux(installdir: &str,linkedgame: Option<&str>) -> Vec<
             continue
         };
 
-        let path = normalize(&path.to_string_lossy().to_string());
+        let exe = path.to_string_lossy().to_string();
+        let lc_path = normalize(&exe);
 
         let matched = match linkedgame {
-            Some(lg) => lg == path,
-            None => path.starts_with(&installdir)
+            Some(lg) => lg == lc_path,
+            None => lc_path.starts_with(&installdir)
         };
 
         if matched {
-            processes.push(ActiveProcess { pid, exe: path });
+            processes.push(ActiveProcess { pid, exe });
         }
     }
 
